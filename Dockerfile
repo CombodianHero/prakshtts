@@ -1,24 +1,31 @@
 # ============================================================
-# Prakash Tour & Travels — Koyeb deployment image
+# Prakash Tour & Travels — Koyeb Production Dockerfile
 # ============================================================
-FROM node:24-slim
+
+FROM node:24-bookworm-slim
+
 WORKDIR /app
 
-# OpenSSL is required by Prisma's query engine on Debian-based images
-RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+# Copy dependency files first for Docker cache
+COPY package.json package-lock.json ./
 
-# Copy package.json + the Prisma schema BEFORE `npm install`, since
-# `npm install` triggers the "postinstall": "prisma generate" script,
-# which needs prisma/schema.prisma to already be present.
-COPY package.json ./
+# Copy Prisma schema before npm install
 COPY prisma ./prisma
-RUN npm install --omit=dev
 
-# Now copy the rest of the app (server.js, static site, api/, lib/)
+# Install production dependencies
+RUN npm ci --omit=dev
+
+# Generate Prisma Client
+RUN npx prisma generate
+
+# Copy application source
 COPY . .
 
+# Production environment
 ENV NODE_ENV=production
-EXPOSE 8000
 ENV PORT=8000
 
+EXPOSE 8000
+
+# Start application
 CMD ["node", "server.js"]
