@@ -1,0 +1,12 @@
+# Environment variables — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Vercel
+.vercel
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+node_modules/
