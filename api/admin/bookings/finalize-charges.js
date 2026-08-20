@@ -8,17 +8,19 @@
  *
  * Production final-payment flow:
  * 1. Verify admin
- * 2. Verify booking and trip completion
- * 3. Prevent duplicate active final-payment links
- * 4. Recalculate all financial values server-side
- * 5. Create secure final-payment request
- * 6. Create REQUIRED payment record
- * 7. Update booking status
- * 8. Add timeline and audit records
- * 9. Reload latest booking + charges
- * 10. Build correct payment URL
- * 11. Normalize charge labels to prevent "undefined"
- * 12. Send itemized final-payment email
+ * 2. Validate booking
+ * 3. Validate APP_URL
+ * 4. Verify trip is completed
+ * 5. Prevent duplicate active final payment request
+ * 6. Recalculate financial values inside one transaction
+ * 7. Create secure FINAL payment request
+ * 8. Create REQUIRED payment record
+ * 9. Update booking payment status
+ * 10. Add timeline and audit records
+ * 11. Reload latest booking and charges
+ * 12. Build correct URL: /payment.html?token=...
+ * 13. Normalize charge labels for email
+ * 14. Send final-payment email
  */
 
 const { prisma } = require("../../../lib/db");
@@ -43,30 +45,41 @@ module.exports = withErrorHandling(
     if (!methodGuard(req, res, "POST")) return;
 
     // ============================================================
-    // 1. READ REQUEST
+    // 1. READ AND VALIDATE REQUEST
     // ============================================================
 
-    const { bookingId } = await readJsonBody(req);
+    const body = await readJsonBody(req);
+    const bookingId =
+      typeof body?.bookingId === "string"
+        ? body.bookingId.trim()
+        : "";
 
-    if (!bookingId || typeof bookingId !== "string") {
+    if (!bookingId) {
       return sendJson(res, 400, {
         error: "bookingId is required.",
       });
     }
 
     // ============================================================
-    // 2. APP URL VALIDATION
+    // 2. VALIDATE PUBLIC APPLICATION URL
     // ============================================================
 
-    const appUrl = (process.env.APP_URL || "").trim().replace(/\/$/, "");
+    const appUrl = (process.env.APP_URL || "")
+      .trim()
+      .replace(/\/+$/, "");
 
     if (!appUrl) {
-      throw Object.assign(
-        new Error(
-          "APP_URL environment variable is missing. Add your public Koyeb domain to the environment variables."
-        ),
-        { statusCode: 500 }
-      );
+      return sendJson(res, 500, {
+        error:
+          "APP_URL environment variable is missing. Set it to your public application URL.",
+      });
+    }
+
+    if (!/^https?:\/\//i.test(appUrl)) {
+      return sendJson(res, 500, {
+        error:
+          "APP_URL must start with http:// or https://",
+      });
     }
 
     // ============================================================
@@ -87,7 +100,7 @@ module.exports = withErrorHandling(
     }
 
     // ============================================================
-    // 4. ONLY ALLOW AFTER TRAVEL COMPLETION
+    // 4. VALIDATE TRIP STATUS
     // ============================================================
 
     if (booking.tripStatus !== "TRAVEL_COMPLETED") {
@@ -98,7 +111,7 @@ module.exports = withErrorHandling(
     }
 
     // ============================================================
-    // 5. PREVENT DUPLICATE ACTIVE FINAL PAYMENT REQUEST
+    // 5. PREVENT DUPLICATE ACTIVE FINAL PAYMENT LINK
     // ============================================================
 
     const existingActiveFinal =
@@ -111,33 +124,51 @@ module.exports = withErrorHandling(
       });
 
     if (existingActiveFinal) {
+      const existingPaymentUrl =
+        `${appUrl}/payment.html?token=` +
+        encodeURIComponent(existingActiveFinal.secureToken);
+
       return sendJson(res, 409, {
-        error:
-          "A final payment request is already active for this booking.",
+        error: "A final payment request is already active for this booking.",
+        paymentUrl: existingPaymentUrl,
+        expiresAt: existingActiveFinal.expiresAt,
       });
     }
 
     // ============================================================
-    // 6. DATABASE TRANSACTION
+    // 6. CREATE FINAL PAYMENT REQUEST IN TRANSACTION
     // ============================================================
 
     const transactionResult = await prisma.$transaction(
       async (tx) => {
-        // Recalculate using the transaction client.
+        /*
+         * IMPORTANT:
+         * recalculateBookingFinancials MUST use the supplied `tx`
+         * for all Prisma queries when tx is provided.
+         */
         const recalced = await recalculateBookingFinancials(
           booking.id,
           tx
         );
 
         const outstandingBalance = Number(
-          recalced.outstandingBalance || 0
+          recalced?.outstandingBalance || 0
         );
 
         const finalAmountDue = Number(
-          recalced.finalAmountDue || 0
+          recalced?.finalAmountDue || 0
         );
 
-        // Safety validation.
+        if (
+          !Number.isFinite(outstandingBalance) ||
+          !Number.isFinite(finalAmountDue)
+        ) {
+          throw Object.assign(
+            new Error("Invalid financial calculation result."),
+            { statusCode: 500 }
+          );
+        }
+
         if (outstandingBalance <= 0 || finalAmountDue <= 0) {
           throw Object.assign(
             new Error(
@@ -147,7 +178,7 @@ module.exports = withErrorHandling(
           );
         }
 
-        // Update booking payment status.
+        // Update booking status.
         const updatedBooking = await tx.booking.update({
           where: {
             id: booking.id,
@@ -157,10 +188,29 @@ module.exports = withErrorHandling(
           },
         });
 
-        // Generate secure payment token.
+        // Generate a new secure token.
         const secureToken = generateSecureToken();
 
-        // Create final payment request.
+        if (
+          !secureToken ||
+          typeof secureToken !== "string"
+        ) {
+          throw new Error(
+            "Secure payment token generation failed."
+          );
+        }
+
+        // Token expiry.
+        const expiresAt = new Date(
+          Date.now() +
+          PAYMENT_LINK_TTL_DAYS *
+          24 *
+          60 *
+          60 *
+          1000
+        );
+
+        // Create payment request.
         const paymentRequest =
           await tx.paymentRequest.create({
             data: {
@@ -169,18 +219,11 @@ module.exports = withErrorHandling(
               amount: finalAmountDue,
               secureToken,
               status: "ACTIVE",
-              expiresAt: new Date(
-                Date.now() +
-                  PAYMENT_LINK_TTL_DAYS *
-                    24 *
-                    60 *
-                    60 *
-                    1000
-              ),
+              expiresAt,
             },
           });
 
-        // Create REQUIRED payment record.
+        // Create REQUIRED payment row.
         await tx.payment.create({
           data: {
             bookingId: booking.id,
@@ -191,7 +234,7 @@ module.exports = withErrorHandling(
           },
         });
 
-        // Timeline events.
+        // Timeline.
         await addTimelineEvent(
           booking.id,
           "FINAL_CHARGES_ADDED",
@@ -208,11 +251,13 @@ module.exports = withErrorHandling(
         await addAuditLog(
           {
             adminId: session.adminId,
-            actionType: "FINAL_PAYMENT_REQUEST_CREATED",
+            actionType:
+              "FINAL_PAYMENT_REQUEST_CREATED",
             entityType: "Booking",
             entityId: booking.id,
             oldValue: null,
             newValue: {
+              paymentStage: "FINAL",
               finalAmountDue,
               outstandingBalance,
               paymentRequestId: paymentRequest.id,
@@ -224,12 +269,16 @@ module.exports = withErrorHandling(
         return {
           updatedBooking,
           paymentRequest,
-          recalced,
+          recalced: {
+            ...recalced,
+            outstandingBalance,
+            finalAmountDue,
+          },
         };
       },
       {
         maxWait: 10000,
-        timeout: 20000,
+        timeout: 30000,
       }
     );
 
@@ -240,9 +289,22 @@ module.exports = withErrorHandling(
     } = transactionResult;
 
     // ============================================================
-    // 7. RELOAD CHARGES AFTER TRANSACTION
+    // 7. BUILD THE EXACT PAYMENT URL
     //
-    // This ensures the email gets current database data.
+    // Correct:
+    // https://your-domain/payment.html?token=ABC
+    //
+    // Incorrect:
+    // /payment/ABC
+    // /payment.html?token=BOOKING-ID
+    // ============================================================
+
+    const paymentUrl =
+      `${appUrl}/payment.html?token=` +
+      encodeURIComponent(paymentRequest.secureToken);
+
+    // ============================================================
+    // 8. RELOAD LATEST BOOKING DATA
     // ============================================================
 
     const freshBooking = await prisma.booking.findUnique({
@@ -257,58 +319,43 @@ module.exports = withErrorHandling(
     if (!freshBooking) {
       throw Object.assign(
         new Error(
-          "Booking disappeared after final payment request creation."
+          "Final payment was created, but the booking could not be reloaded."
         ),
         { statusCode: 500 }
       );
     }
 
     // ============================================================
-    // 8. CREATE CORRECT PAYMENT URL
-    //
-    // IMPORTANT:
-    // Your payment page uses:
-    // /payment.html?token=TOKEN
-    //
-    // NOT:
-    // /payment/TOKEN
-    // ============================================================
-
-    const paymentUrl =
-      `${appUrl}/payment.html?token=` +
-      encodeURIComponent(paymentRequest.secureToken);
-
-    // ============================================================
-    // 9. NORMALIZE CHARGES
+    // 9. NORMALIZE ADDITIONAL CHARGES
     //
     // Prevents "undefined" in the email.
-    // The mail template can safely use charge.label and charge.amount.
     // ============================================================
 
-    const normalizedCharges = (freshBooking.charges || []).map(
-      (charge) => ({
-        id: charge.id,
+    const normalizedCharges =
+      (freshBooking.charges || []).map((charge) => {
+        const label =
+          [
+            charge.description,
+            charge.name,
+            charge.category,
+            charge.type,
+          ].find(
+            (value) =>
+              typeof value === "string" &&
+              value.trim().length > 0
+          ) || "Additional Charge";
 
-        label:
-          charge.description ||
-          charge.name ||
-          charge.category ||
-          charge.type ||
-          "Additional Charge",
-
-        description:
-          charge.description ||
-          charge.name ||
-          charge.category ||
-          charge.type ||
-          "Additional Charge",
-
-        amount: Number(charge.amount || 0),
-      })
-    );
+        return {
+          id: charge.id,
+          label,
+          description: label,
+          name: label,
+          amount: Number(charge.amount || 0),
+        };
+      });
 
     // ============================================================
-    // 10. EMAIL DATA
+    // 10. FINANCIAL VALUES FOR EMAIL
     // ============================================================
 
     const remainingBaseAmount = Number(
@@ -321,36 +368,55 @@ module.exports = withErrorHandling(
 
     // ============================================================
     // 11. SEND EMAIL
+    //
+    // Email is intentionally outside the database transaction.
+    // Therefore an email provider failure cannot roll back or
+    // corrupt an already-created payment request.
     // ============================================================
 
-    await sendAndLogEmail(
-      "final_payment_required",
-      freshBooking.customerEmail,
-      {
-        booking: {
-          ...freshBooking,
+    let emailSent = false;
+    let emailError = null;
 
-          finalAmountDue,
+    try {
+      await sendAndLogEmail(
+        "final_payment_required",
+        freshBooking.customerEmail,
+        {
+          booking: {
+            ...freshBooking,
+            finalAmountDue,
+            remainingBaseAmount,
+          },
+
+          charges: normalizedCharges,
+          additionalCharges: normalizedCharges,
 
           remainingBaseAmount,
+          finalAmountDue,
+
+          // Correct complete URL with secure token.
+          paymentUrl,
+
+          // Available for templates that construct URLs themselves.
+          paymentToken: paymentRequest.secureToken,
+          secureToken: paymentRequest.secureToken,
+
+          paymentLinkExpiresAt:
+            paymentRequest.expiresAt,
         },
+        freshBooking.id
+      );
 
-        // Keep both names in case the mail template uses either.
-        charges: normalizedCharges,
-        additionalCharges: normalizedCharges,
+      emailSent = true;
+    } catch (error) {
+      console.error(
+        "[finalize-charges] Final payment email failed:",
+        error
+      );
 
-        remainingBaseAmount,
-
-        finalAmountDue,
-
-        paymentUrl,
-
-        paymentToken: paymentRequest.secureToken,
-
-        paymentLinkExpiresAt: paymentRequest.expiresAt,
-      },
-      freshBooking.id
-    );
+      emailError =
+        "Final payment request was created successfully, but the email could not be sent.";
+    }
 
     // ============================================================
     // 12. SUCCESS RESPONSE
@@ -359,8 +425,12 @@ module.exports = withErrorHandling(
     return sendJson(res, 200, {
       success: true,
 
-      message:
-        "Final charges were finalized and the final payment request was sent to the customer.",
+      message: emailSent
+        ? "Final charges were finalized and the final payment link was sent to the customer."
+        : "Final charges were finalized and the payment link was created. The customer email could not be sent.",
+
+      emailSent,
+      emailError,
 
       booking: updatedBooking,
 
@@ -368,6 +438,7 @@ module.exports = withErrorHandling(
         stage: "FINAL",
         amount: finalAmountDue,
         expiresAt: paymentRequest.expiresAt,
+        token: paymentRequest.secureToken,
       },
 
       paymentUrl,
