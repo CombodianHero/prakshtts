@@ -2,18 +2,19 @@ FROM node:24-bookworm-slim
 
 WORKDIR /app
 
-# Copy dependency files and Prisma schema first.
-# npm ci runs "postinstall", which runs "prisma generate".
+# Copy dependency files first for Docker cache efficiency
 COPY package.json package-lock.json ./
+
+# Copy Prisma schema before dependency installation
 COPY prisma ./prisma
 
-# Install exactly the versions recorded in package-lock.json.
-RUN npm ci --include=prod
+# Install exact dependencies from the synchronized lock file
+RUN npm ci
 
-# Copy application source.
+# Copy the remaining application source
 COPY . .
 
-# Generate Prisma Client after the complete application is available.
+# Generate Prisma Client
 RUN npx prisma generate
 
 ENV NODE_ENV=production
@@ -21,5 +22,5 @@ ENV PORT=8000
 
 EXPOSE 8000
 
-# Synchronize the database schema, then start the server.
+# Synchronize schema, then start the server
 CMD ["sh", "-c", "npx prisma db push --skip-generate && node server.js"]
