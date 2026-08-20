@@ -1,31 +1,24 @@
-# ============================================================
-# Prakash Tour & Travels — Koyeb Production Dockerfile
-# ============================================================
-
 FROM node:24-bookworm-slim
 
 WORKDIR /app
 
-# Copy dependency files first for Docker cache
+# Install dependencies
 COPY package.json package-lock.json ./
+RUN npm ci
 
-# Copy Prisma schema before npm install
+# Copy Prisma schema
 COPY prisma ./prisma
-
-# Install production dependencies
-RUN npm ci --omit=dev
 
 # Generate Prisma Client
 RUN npx prisma generate
 
-# Copy application source
+# Copy the rest of the application
 COPY . .
 
-# Production environment
 ENV NODE_ENV=production
 ENV PORT=8000
 
 EXPOSE 8000
 
-# Start application
-CMD ["node", "server.js"]
+# Create/update database tables, then start server
+CMD ["sh", "-c", "npx prisma db push && node server.js"]
