@@ -20,7 +20,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "postinstall": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
     "db:studio": "prisma studio"
