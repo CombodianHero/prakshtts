@@ -69,7 +69,12 @@ module.exports = withErrorHandling(async (req, res) => {
     });
   }
 
-  const { url, fileName } = await uploadReceipt(file.buffer, file.mimeType, paymentRequest.booking.bookingId);
+  const { url, fileName } = await uploadReceipt(
+    file.buffer,
+    file.mimeType,
+    paymentRequest.booking.bookingId,
+    file.filename
+  );
 
   const payment = await prisma.$transaction(async (tx) => {
     const created = await tx.payment.create({
