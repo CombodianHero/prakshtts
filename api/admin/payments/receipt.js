@@ -1,59 +1,65 @@
-const { head } = require("@vercel/blob");
 const { prisma } = require("../../../lib/db");
 const { requireAdmin } = require("../../../lib/auth");
+const { getReceiptMetadata } = require("../../../lib/blob");
+
 const {
   sendJson,
   methodGuard,
-  withErrorHandling
+  withErrorHandling,
 } = require("../../../lib/apiUtils");
 
-module.exports = withErrorHandling(async (req, res) => {
-  if (!methodGuard(req, res, "GET")) return;
+module.exports = withErrorHandling(
+  requireAdmin(async (req, res) => {
+    if (!methodGuard(req, res, "GET")) return;
 
-  // Only logged-in admin can view receipts
-  await requireAdmin(req, res);
+    const paymentId = String(
+      req.query.paymentId || ""
+    ).trim();
 
-  const paymentId = req.query.id;
-
-  if (!paymentId) {
-    return sendJson(res, 400, {
-      error: "Payment ID is required."
-    });
-  }
-
-  const payment = await prisma.payment.findUnique({
-    where: { id: paymentId },
-    select: {
-      id: true,
-      receiptUrl: true,
-      receiptFileName: true
+    if (!paymentId) {
+      return sendJson(res, 400, {
+        error: "paymentId is required.",
+      });
     }
-  });
 
-  if (!payment) {
-    return sendJson(res, 404, {
-      error: "Payment not found."
-    });
-  }
+    const payment =
+      await prisma.payment.findUnique({
+        where: {
+          id: paymentId,
+        },
+      });
 
-  if (!payment.receiptUrl) {
-    return sendJson(res, 404, {
-      error: "No receipt was uploaded for this payment."
-    });
-  }
-
-  const blob = await head(payment.receiptUrl, {
-    token: process.env.BLOB_READ_WRITE_TOKEN
-  });
-
-  return sendJson(res, 200, {
-    success: true,
-    receipt: {
-      url: payment.receiptUrl,
-      pathname: blob.pathname,
-      contentType: blob.contentType,
-      size: blob.size,
-      uploadedAt: blob.uploadedAt
+    if (!payment) {
+      return sendJson(res, 404, {
+        error: "Payment not found.",
+      });
     }
-  });
-});
+
+    if (!payment.receiptUrl) {
+      return sendJson(res, 404, {
+        error:
+          "No receipt is attached to this payment.",
+      });
+    }
+
+    const blob =
+      await getReceiptMetadata(payment.receiptUrl);
+
+    return sendJson(res, 200, {
+      success: true,
+      paymentId: payment.id,
+      fileName:
+        payment.receiptFileName ||
+        "receipt",
+      contentType:
+        blob.contentType ||
+        "application/octet-stream",
+
+      // Depending on your installed @vercel/blob
+      // version, Blob metadata can expose a URL.
+      url: blob.url || null,
+
+      pathname: payment.receiptUrl,
+    });
+  })
+);
