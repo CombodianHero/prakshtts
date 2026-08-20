@@ -3,25 +3,24 @@
  *
  * Body:
  * {
- *   bookingId,
- *   baseAmount,
+ *   bookingId: "TRV-2026-00001",
+ *   baseAmount: 10000,
  *   advanceMode: "DEFAULT_PERCENT" | "CUSTOM_PERCENT" | "MANUAL_AMOUNT",
- *   advancePercentage?,
- *   manualAdvanceAmount?
+ *   advancePercentage: 30,
+ *   manualAdvanceAmount: 3000
  * }
  *
  * Production flow:
- * 1. Validate admin request
- * 2. Validate booking and pricing
- * 3. Calculate advance amount
- * 4. Approve booking
- * 5. Recalculate financial values
- * 6. Create secure ADVANCE payment request
- * 7. Create REQUIRED payment record
- * 8. Add timeline and audit records
- * 9. Commit transaction
- * 10. Build the correct payment.html?token= URL
- * 11. Send payment email
+ * 1. Validate admin and request.
+ * 2. Calculate advance amount.
+ * 3. Approve booking.
+ * 4. Save pricing.
+ * 5. Create secure ADVANCE payment request.
+ * 6. Create REQUIRED payment record.
+ * 7. Add timeline/audit records.
+ * 8. Commit database transaction.
+ * 9. Build /payment.html?token=SECURE_TOKEN URL.
+ * 10. Send email AFTER transaction.
  */
 
 const { prisma } = require("../../../lib/db");
@@ -29,7 +28,6 @@ const { requireAdmin } = require("../../../lib/auth");
 
 const {
   computeAdvanceRequired,
-  recalculateBookingFinancials,
   round2,
 } = require("../../../lib/calc");
 
@@ -46,12 +44,15 @@ const {
   withErrorHandling,
 } = require("../../../lib/apiUtils");
 
+
 const DEFAULT_ADVANCE_PERCENT = 30;
 const PAYMENT_LINK_TTL_DAYS = 7;
+
 
 module.exports = withErrorHandling(
   requireAdmin(async (req, res, session) => {
     if (!methodGuard(req, res, "POST")) return;
+
 
     // ============================================================
     // 1. READ REQUEST
@@ -59,83 +60,156 @@ module.exports = withErrorHandling(
 
     const body = await readJsonBody(req);
 
-    const {
-      bookingId,
-      advanceMode = "DEFAULT_PERCENT",
-      advancePercentage,
-      manualAdvanceAmount,
-    } = body;
+    const bookingId =
+      typeof body.bookingId === "string"
+        ? body.bookingId.trim()
+        : "";
 
-    const baseAmount = round2(toNumber(body.baseAmount, -1));
+    const advanceMode =
+      body.advanceMode || "DEFAULT_PERCENT";
 
-    if (!bookingId || typeof bookingId !== "string") {
+    const baseAmount =
+      round2(toNumber(body.baseAmount, -1));
+
+
+    if (!bookingId) {
       return sendJson(res, 400, {
         error: "bookingId is required.",
       });
     }
 
-    if (!Number.isFinite(baseAmount) || baseAmount < 0) {
+
+    if (!Number.isFinite(baseAmount) || baseAmount <= 0) {
       return sendJson(res, 400, {
-        error: "A valid, non-negative base amount is required.",
+        error: "baseAmount must be greater than ₹0.",
       });
     }
 
-    // ============================================================
-    // 2. VALIDATE ADVANCE MODE
-    // ============================================================
 
-    const validAdvanceModes = [
+    const allowedModes = [
       "DEFAULT_PERCENT",
       "CUSTOM_PERCENT",
       "MANUAL_AMOUNT",
     ];
 
-    if (!validAdvanceModes.includes(advanceMode)) {
+    if (!allowedModes.includes(advanceMode)) {
       return sendJson(res, 400, {
-        error: "Invalid advance mode.",
+        error:
+          "advanceMode must be DEFAULT_PERCENT, CUSTOM_PERCENT, or MANUAL_AMOUNT.",
       });
     }
 
+
+    // ============================================================
+    // 2. VALIDATE ADVANCE SETTINGS
+    // ============================================================
+
+    let effectivePercentage = DEFAULT_ADVANCE_PERCENT;
+    let manualAdvanceAmount = null;
+
+
     if (advanceMode === "CUSTOM_PERCENT") {
-      const percentage = toNumber(advancePercentage, 0);
+      effectivePercentage =
+        round2(toNumber(body.advancePercentage, -1));
 
       if (
-        !Number.isFinite(percentage) ||
-        percentage <= 0 ||
-        percentage > 100
-      ) {
-        return sendJson(res, 400, {
-          error: "Advance percentage must be greater than 0 and at most 100.",
-        });
-      }
-    }
-
-    if (advanceMode === "MANUAL_AMOUNT") {
-      const manualAmount = round2(
-        toNumber(manualAdvanceAmount, -1)
-      );
-
-      if (
-        !Number.isFinite(manualAmount) ||
-        manualAmount <= 0 ||
-        manualAmount > baseAmount
+        !Number.isFinite(effectivePercentage) ||
+        effectivePercentage <= 0 ||
+        effectivePercentage > 100
       ) {
         return sendJson(res, 400, {
           error:
-            "Manual advance amount must be greater than ₹0 and cannot exceed the base amount.",
+            "advancePercentage must be greater than 0 and at most 100.",
         });
       }
     }
 
+
+    if (advanceMode === "MANUAL_AMOUNT") {
+      manualAdvanceAmount =
+        round2(toNumber(body.manualAdvanceAmount, -1));
+
+      if (
+        !Number.isFinite(manualAdvanceAmount) ||
+        manualAdvanceAmount <= 0 ||
+        manualAdvanceAmount > baseAmount
+      ) {
+        return sendJson(res, 400, {
+          error:
+            "manualAdvanceAmount must be greater than ₹0 and cannot exceed the base amount.",
+        });
+      }
+    }
+
+
     // ============================================================
-    // 3. LOAD BOOKING
+    // 3. CALCULATE ADVANCE BEFORE DATABASE TRANSACTION
     // ============================================================
 
-    const existing = await prisma.booking.findUnique({
-      where: {
-        bookingId: bookingId.trim(),
-      },
-    });
+    const advanceRequiredAmount =
+      round2(
+        computeAdvanceRequired({
+          baseAmount,
+          advanceMode,
+          advancePercentage: effectivePercentage,
+          manualAdvanceAmount,
+        })
+      );
+
+
+    // IMPORTANT:
+    // Never create a payment request for ₹0.
+
+    if (
+      !Number.isFinite(advanceRequiredAmount) ||
+      advanceRequiredAmount <= 0
+    ) {
+      return sendJson(res, 409, {
+        error:
+          "Advance payment amount is ₹0. Please configure a valid advance amount or percentage.",
+      });
+    }
+
+
+    if (advanceRequiredAmount > baseAmount) {
+      return sendJson(res, 400, {
+        error:
+          "Advance payment cannot be greater than the base amount.",
+      });
+    }
+
+
+    // ============================================================
+    // 4. VALIDATE APP URL
+    // ============================================================
+
+    const appUrl =
+      String(process.env.APP_URL || "")
+        .trim()
+        .replace(/\/+$/, "");
+
+
+    if (!appUrl) {
+      throw Object.assign(
+        new Error(
+          "APP_URL environment variable is missing."
+        ),
+        { statusCode: 500 }
+      );
+    }
+
+
+    // ============================================================
+    // 5. LOAD BOOKING
+    // ============================================================
+
+    const existing =
+      await prisma.booking.findUnique({
+        where: {
+          bookingId,
+        },
+      });
+
 
     if (!existing) {
       return sendJson(res, 404, {
@@ -143,364 +217,280 @@ module.exports = withErrorHandling(
       });
     }
 
+
     if (existing.bookingStatus !== "PENDING_APPROVAL") {
       return sendJson(res, 409, {
-        error: `Booking is already ${existing.bookingStatus}, cannot approve again.`,
-      });
-    }
-
-    // ============================================================
-    // 4. CALCULATE EXPECTED ADVANCE
-    // ============================================================
-
-    const effectivePercentage =
-      advanceMode === "DEFAULT_PERCENT"
-        ? DEFAULT_ADVANCE_PERCENT
-        : advanceMode === "CUSTOM_PERCENT"
-          ? toNumber(advancePercentage, DEFAULT_ADVANCE_PERCENT)
-          : null;
-
-    const calculatedAdvanceAmount = round2(
-      computeAdvanceRequired({
-        baseAmount,
-        advanceMode,
-        advancePercentage: effectivePercentage,
-        manualAdvanceAmount:
-          advanceMode === "MANUAL_AMOUNT"
-            ? toNumber(manualAdvanceAmount, 0)
-            : undefined,
-      })
-    );
-
-    if (
-      !Number.isFinite(calculatedAdvanceAmount) ||
-      calculatedAdvanceAmount <= 0
-    ) {
-      return sendJson(res, 409, {
         error:
-          "Advance payment amount is ₹0. Please configure a valid advance percentage or manual advance amount.",
+          `Booking is already ${existing.bookingStatus}, cannot approve again.`,
       });
     }
 
+
     // ============================================================
-    // 5. DATABASE TRANSACTION
+    // 6. CREATE TOKEN BEFORE TRANSACTION
     // ============================================================
 
-    const transactionResult = await prisma.$transaction(
-      async (tx) => {
-        // --------------------------------------------------------
-        // Approve and save initial pricing.
-        // --------------------------------------------------------
+    const secureToken = generateSecureToken();
 
-        const updated = await tx.booking.update({
-          where: {
-            id: existing.id,
-          },
-          data: {
-            baseAmount,
+    const expiresAt =
+      new Date(
+        Date.now() +
+        PAYMENT_LINK_TTL_DAYS *
+        24 *
+        60 *
+        60 *
+        1000
+      );
 
-            advanceMode,
 
-            advancePercentage:
-              advanceMode === "MANUAL_AMOUNT"
-                ? null
-                : effectivePercentage,
+    // ============================================================
+    // 7. DATABASE TRANSACTION
+    //
+    // IMPORTANT:
+    // Every database operation inside uses tx.
+    // No email/network request inside transaction.
+    // ============================================================
 
-            advanceRequiredAmount:
-              calculatedAdvanceAmount,
+    const result =
+      await prisma.$transaction(
+        async (tx) => {
 
-            bookingStatus: "APPROVED",
+          const updatedBooking =
+            await tx.booking.update({
+              where: {
+                id: existing.id,
+              },
 
-            paymentStatus:
-              "ADVANCE_PAYMENT_REQUIRED",
+              data: {
+                baseAmount,
 
-            approvedAt: new Date(),
-          },
-        });
+                advanceMode,
 
-        // --------------------------------------------------------
-        // Recalculate all financial fields using THIS transaction.
-        // --------------------------------------------------------
+                advancePercentage:
+                  advanceMode === "MANUAL_AMOUNT"
+                    ? null
+                    : effectivePercentage,
 
-        const recalculated =
-          await recalculateBookingFinancials(
-            updated.id,
-            tx
-          );
+                advanceRequiredAmount,
 
-        // --------------------------------------------------------
-        // IMPORTANT:
-        // Read the advance amount safely from the recalculated
-        // values first, then fall back to the stored calculated value.
-        // --------------------------------------------------------
+                bookingStatus: "APPROVED",
 
-        const advanceAmount = round2(
-          Number(
-            recalculated?.advanceRequiredAmount ??
-            recalculated?.advanceAmount ??
-            updated.advanceRequiredAmount ??
-            calculatedAdvanceAmount ??
-            0
-          )
-        );
+                paymentStatus:
+                  "ADVANCE_PAYMENT_REQUIRED",
 
-        if (
-          !Number.isFinite(advanceAmount) ||
-          advanceAmount <= 0
-        ) {
-          throw Object.assign(
-            new Error(
-              "Advance payment amount is ₹0. Configure the advance amount or percentage before creating the payment request."
-            ),
-            {
-              statusCode: 409,
-            }
-          );
-        }
+                approvedAt:
+                  new Date(),
+              },
+            });
 
-        // --------------------------------------------------------
-        // Generate ONE secure token.
-        // This exact token is saved in DB and later sent by email.
-        // --------------------------------------------------------
 
-        const secureToken = generateSecureToken();
+          const paymentRequest =
+            await tx.paymentRequest.create({
+              data: {
+                bookingId:
+                  updatedBooking.id,
 
-        // --------------------------------------------------------
-        // Create ADVANCE payment request.
-        // --------------------------------------------------------
+                paymentStage:
+                  "ADVANCE",
 
-        const paymentRequest =
-          await tx.paymentRequest.create({
+                amount:
+                  advanceRequiredAmount,
+
+                secureToken,
+
+                status:
+                  "ACTIVE",
+
+                expiresAt,
+              },
+            });
+
+
+          await tx.payment.create({
             data: {
-              bookingId: updated.id,
+              bookingId:
+                updatedBooking.id,
 
-              paymentStage: "ADVANCE",
+              paymentStage:
+                "ADVANCE",
 
-              // Never use 0 here.
-              amount: advanceAmount,
+              paymentType:
+                "MANUAL_UPI",
 
-              secureToken,
+              amount:
+                advanceRequiredAmount,
 
-              status: "ACTIVE",
-
-              expiresAt: new Date(
-                Date.now() +
-                  PAYMENT_LINK_TTL_DAYS *
-                    24 *
-                    60 *
-                    60 *
-                    1000
-              ),
-            },
-          });
-
-        // --------------------------------------------------------
-        // Create REQUIRED payment record.
-        // --------------------------------------------------------
-
-        await tx.payment.create({
-          data: {
-            bookingId: updated.id,
-
-            paymentStage: "ADVANCE",
-
-            // Same amount as PaymentRequest.
-            amount: advanceAmount,
-
-            status: "REQUIRED",
-
-            paymentRequestId:
-              paymentRequest.id,
-          },
-        });
-
-        // --------------------------------------------------------
-        // Timeline
-        // --------------------------------------------------------
-
-        await addTimelineEvent(
-          updated.id,
-          "BOOKING_APPROVED",
-          { tx }
-        );
-
-        await addTimelineEvent(
-          updated.id,
-          "ADVANCE_PAYMENT_REQUIRED",
-          { tx }
-        );
-
-        // --------------------------------------------------------
-        // Audit
-        // --------------------------------------------------------
-
-        await addAuditLog(
-          {
-            adminId: session.adminId,
-
-            actionType:
-              "BOOKING_APPROVED",
-
-            entityType: "Booking",
-
-            entityId: updated.id,
-
-            oldValue: {
-              bookingStatus:
-                existing.bookingStatus,
-
-              baseAmount:
-                Number(existing.baseAmount || 0),
-            },
-
-            newValue: {
-              bookingStatus: "APPROVED",
-
-              baseAmount,
-
-              advanceMode,
-
-              advancePercentage:
-                effectivePercentage,
-
-              advanceRequiredAmount:
-                advanceAmount,
+              status:
+                "REQUIRED",
 
               paymentRequestId:
                 paymentRequest.id,
             },
-          },
-          tx
-        );
+          });
 
-        return {
-          bookingId: updated.id,
 
-          paymentRequest,
+          // These helpers MUST use tx internally when { tx } is supplied.
 
-          advanceAmount,
+          await addTimelineEvent(
+            updatedBooking.id,
+            "BOOKING_APPROVED",
+            { tx }
+          );
 
-          recalculated,
-        };
-      },
-      {
-        maxWait: 10000,
-        timeout: 20000,
-      }
-    );
 
-    // ============================================================
-    // 6. BUILD PAYMENT URL AFTER TRANSACTION
-    // ============================================================
+          await addTimelineEvent(
+            updatedBooking.id,
+            "ADVANCE_PAYMENT_REQUIRED",
+            { tx }
+          );
 
-    const appUrl = String(
-      process.env.APP_URL || ""
-    )
-      .trim()
-      .replace(/\/+$/, "");
 
-    if (!appUrl) {
-      throw Object.assign(
-        new Error(
-          "APP_URL environment variable is missing."
-        ),
+          await addAuditLog(
+            {
+              adminId:
+                session.adminId,
+
+              actionType:
+                "BOOKING_APPROVED",
+
+              entityType:
+                "Booking",
+
+              entityId:
+                updatedBooking.id,
+
+              oldValue: {
+                bookingStatus:
+                  existing.bookingStatus,
+
+                baseAmount:
+                  Number(existing.baseAmount || 0),
+              },
+
+              newValue: {
+                bookingStatus:
+                  "APPROVED",
+
+                baseAmount,
+
+                advanceMode,
+
+                advancePercentage:
+                  advanceMode === "MANUAL_AMOUNT"
+                    ? null
+                    : effectivePercentage,
+
+                advanceRequiredAmount,
+              },
+            },
+            tx
+          );
+
+
+          return {
+            booking:
+              updatedBooking,
+
+            paymentRequest,
+          };
+        },
         {
-          statusCode: 500,
+          maxWait: 10000,
+          timeout: 20000,
         }
       );
-    }
 
-    // IMPORTANT:
-    // Correct URL for your application:
+
+    const {
+      booking,
+      paymentRequest,
+    } = result;
+
+
+    // ============================================================
+    // 8. BUILD CORRECT PAYMENT URL AFTER TRANSACTION
     //
-    // https://your-domain/payment.html?token=SECURE_TOKEN
+    // CORRECT:
+    // /payment.html?token=TOKEN
     //
-    // NOT:
-    // /payment/SECURE_TOKEN
+    // WRONG:
+    // /payment/TOKEN
     // ============================================================
 
     const paymentUrl =
       `${appUrl}/payment.html?token=` +
       encodeURIComponent(
-        transactionResult.paymentRequest.secureToken
+        paymentRequest.secureToken
       );
 
+
     // ============================================================
-    // 7. RELOAD BOOKING FOR EMAIL
+    // 9. EMAIL AFTER DATABASE TRANSACTION
     // ============================================================
 
-    const freshBooking =
-      await prisma.booking.findUnique({
-        where: {
-          id: transactionResult.bookingId,
-        },
-      });
+    const emailBooking = {
+      ...booking,
 
-    if (!freshBooking) {
-      throw Object.assign(
-        new Error(
-          "Booking could not be found after approval."
+      baseAmount:
+        Number(baseAmount),
+
+      advanceRequiredAmount:
+        Number(advanceRequiredAmount),
+
+      remainingBaseAmount:
+        round2(
+          baseAmount -
+          advanceRequiredAmount
         ),
+    };
+
+
+    try {
+      await sendAndLogEmail(
+        "booking_approved_payment_required",
+
+        booking.customerEmail,
+
         {
-          statusCode: 500,
-        }
-      );
-    }
+          booking:
+            emailBooking,
 
-    const advanceAmount =
-      transactionResult.advanceAmount;
-
-    const remainingBaseAmount =
-      round2(baseAmount - advanceAmount);
-
-    // ============================================================
-    // 8. SEND EMAIL
-    //
-    // The email gets the SAME token stored in the database.
-    // ============================================================
-
-    await sendAndLogEmail(
-      "booking_approved_payment_required",
-
-      freshBooking.customerEmail,
-
-      {
-        booking: {
-          ...freshBooking,
-
-          baseAmount,
+          baseAmount:
+            Number(baseAmount),
 
           advanceRequiredAmount:
-            advanceAmount,
+            Number(advanceRequiredAmount),
 
-          advanceAmount,
+          remainingBaseAmount:
+            round2(
+              baseAmount -
+              advanceRequiredAmount
+            ),
 
-          remainingBaseAmount,
+          paymentUrl,
+
+          paymentToken:
+            paymentRequest.secureToken,
+
+          paymentLinkExpiresAt:
+            paymentRequest.expiresAt,
         },
 
-        advanceAmount,
+        booking.id
+      );
+    } catch (emailError) {
 
-        advanceRequiredAmount:
-          advanceAmount,
+      console.error(
+        "[approve booking email error]",
+        emailError
+      );
 
-        remainingBaseAmount,
+      // Booking/payment request remains valid even if email fails.
+    }
 
-        paymentUrl,
-
-        paymentToken:
-          transactionResult.paymentRequest
-            .secureToken,
-
-        paymentLinkExpiresAt:
-          transactionResult.paymentRequest
-            .expiresAt,
-      },
-
-      freshBooking.id
-    );
 
     // ============================================================
-    // 9. SUCCESS RESPONSE
+    // 10. SUCCESS
     // ============================================================
 
     return sendJson(res, 200, {
@@ -509,27 +499,20 @@ module.exports = withErrorHandling(
       message:
         "Booking approved and advance payment request created successfully.",
 
-      booking: {
-        ...freshBooking,
-
-        baseAmount,
-
-        advanceRequiredAmount:
-          advanceAmount,
-      },
+      booking,
 
       payment: {
-        stage: "ADVANCE",
+        stage:
+          "ADVANCE",
 
-        amount: advanceAmount,
-
-        token:
-          transactionResult.paymentRequest
-            .secureToken,
+        amount:
+          Number(paymentRequest.amount),
 
         expiresAt:
-          transactionResult.paymentRequest
-            .expiresAt,
+          paymentRequest.expiresAt,
+
+        token:
+          paymentRequest.secureToken,
       },
 
       paymentUrl,
