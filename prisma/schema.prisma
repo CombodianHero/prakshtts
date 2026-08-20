@@ -1,0 +1,413 @@
+// ============================================================
+// PRAKASH TOUR & TRAVELS — PRODUCTION DATABASE SCHEMA
+// Postgres via Prisma. Works with Neon / Supabase / Vercel Postgres.
+//
+// Setup:
+//   1. Set DATABASE_URL in .env.local (and in Vercel env vars)
+//   2. npx prisma migrate dev --name init      (local/dev)
+//      npx prisma migrate deploy               (production, in CI/CD)
+//   3. npx prisma generate
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------
+// ENUMS
+// ------------------------------------------------------------
+
+enum BookingStatus {
+  PENDING_APPROVAL
+  APPROVED
+  CONFIRMED
+  REJECTED
+  CANCELLED
+  COMPLETED
+}
+
+enum PaymentStatusOverall {
+  NO_PAYMENT_REQUIRED_YET
+  ADVANCE_PAYMENT_REQUIRED
+  ADVANCE_PAYMENT_PENDING
+  ADVANCE_PAYMENT_UNDER_VERIFICATION
+  ADVANCE_PAYMENT_REJECTED
+  ADVANCE_PAID
+  FINAL_PAYMENT_REQUIRED
+  FINAL_PAYMENT_PENDING
+  FINAL_PAYMENT_UNDER_VERIFICATION
+  FINAL_PAYMENT_REJECTED
+  FULLY_PAID
+}
+
+enum TripStatus {
+  NOT_ASSIGNED
+  VEHICLE_ASSIGNED
+  UPCOMING
+  ON_TRIP
+  TRAVEL_COMPLETED
+}
+
+enum VehicleStatus {
+  AVAILABLE
+  RESERVED
+  ON_TRIP
+  MAINTENANCE
+  UNAVAILABLE
+  INACTIVE
+}
+
+enum DriverStatus {
+  AVAILABLE
+  ASSIGNED
+  ON_TRIP
+  UNAVAILABLE
+  INACTIVE
+}
+
+enum PaymentStage {
+  ADVANCE
+  FINAL
+}
+
+enum PaymentRecordStatus {
+  REQUIRED
+  PENDING_SUBMISSION
+  UNDER_VERIFICATION
+  APPROVED
+  REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentRequestStatus {
+  ACTIVE
+  PAID
+  EXPIRED
+  REVOKED
+}
+
+enum ChargeType {
+  TOLL
+  PARKING
+  OTHER
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum QueryStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+}
+
+enum AdvanceMode {
+  DEFAULT_PERCENT
+  CUSTOM_PERCENT
+  MANUAL_AMOUNT
+}
+
+// ------------------------------------------------------------
+// CORE ENTITIES
+// ------------------------------------------------------------
+
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique // normalized (lowercase, trimmed)
+  phone     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@index([email])
+}
+
+model Vehicle {
+  id               String        @id @default(cuid())
+  vehicleName      String
+  vehicleType      String
+  vehicleNumber    String?       @unique
+  seatingCapacity  Int
+  description      String?
+  features         String[]      @default([])
+  imageUrl         String?
+  status           VehicleStatus @default(AVAILABLE)
+  bookingEnabled   Boolean       @default(true)
+  recommended      Boolean       @default(false)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  requestedForBookings Booking[] @relation("RequestedVehicle")
+  assignedToBookings   Booking[] @relation("AssignedVehicle")
+  drivers              Driver[]  @relation("DefaultVehicle")
+
+  @@index([status, bookingEnabled])
+}
+
+model Driver {
+  id               String       @id @default(cuid())
+  driverName       String
+  phone            String
+  email            String?
+  defaultVehicleId String?
+  defaultVehicle   Vehicle?     @relation("DefaultVehicle", fields: [defaultVehicleId], references: [id])
+  status           DriverStatus @default(AVAILABLE)
+  notes            String?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  bookings Booking[]
+
+  @@index([status])
+}
+
+model Booking {
+  id        String @id @default(cuid())
+  bookingId String @unique // e.g. TRV-2026-00001
+
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id])
+  customerName  String
+  customerEmail String
+  customerPhone String
+
+  pickupLocation      String
+  destination         String
+  tripType             String
+  travelDate           DateTime
+  pickupTime           String?
+  returnDate           DateTime?
+  returnTime           String?
+  passengerCount       Int
+  specialRequirements  String?
+
+  requestedVehicleId   String?
+  requestedVehicle     Vehicle? @relation("RequestedVehicle", fields: [requestedVehicleId], references: [id])
+  requestedVehicleName String?
+
+  assignedVehicleId String?
+  assignedVehicle   Vehicle? @relation("AssignedVehicle", fields: [assignedVehicleId], references: [id])
+  assignedDriverId  String?
+  assignedDriver    Driver?  @relation(fields: [assignedDriverId], references: [id])
+
+  bookingStatus BookingStatus        @default(PENDING_APPROVAL)
+  paymentStatus PaymentStatusOverall @default(NO_PAYMENT_REQUIRED_YET)
+  tripStatus    TripStatus           @default(NOT_ASSIGNED)
+
+  baseAmount            Decimal @default(0) @db.Decimal(10, 2)
+  advanceMode           AdvanceMode @default(DEFAULT_PERCENT)
+  advancePercentage     Decimal @default(30) @db.Decimal(5, 2)
+  advanceRequiredAmount Decimal @default(0) @db.Decimal(10, 2)
+  advancePaidAmount     Decimal @default(0) @db.Decimal(10, 2)
+  remainingBaseAmount   Decimal @default(0) @db.Decimal(10, 2)
+
+  additionalChargesTotal Decimal @default(0) @db.Decimal(10, 2)
+  finalAmountDue         Decimal @default(0) @db.Decimal(10, 2)
+  totalPaidAmount        Decimal @default(0) @db.Decimal(10, 2)
+  outstandingBalance     Decimal @default(0) @db.Decimal(10, 2)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  approvedAt  DateTime?
+  confirmedAt DateTime?
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  payments         Payment[]
+  paymentRequests  PaymentRequest[]
+  charges          AdditionalCharge[]
+  timelineEvents   BookingTimeline[]
+  invoices         Invoice[]
+  emailLogs        EmailLog[]
+  queries          CustomerQuery[]
+
+  @@index([customerEmail])
+  @@index([bookingStatus])
+  @@index([assignedVehicleId, travelDate])
+  @@index([assignedDriverId, travelDate])
+}
+
+model Payment {
+  id     String @id @default(cuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+
+  paymentStage PaymentStage
+  paymentType  String @default("MANUAL_UPI") // MANUAL_UPI | GATEWAY
+
+  amount Decimal @db.Decimal(10, 2)
+  status PaymentRecordStatus @default(REQUIRED)
+
+  paymentRequestId    String?
+  paymentRequest      PaymentRequest? @relation(fields: [paymentRequestId], references: [id])
+  transactionReference String?
+
+  receiptUrl      String?
+  receiptFileName String?
+
+  submittedAt DateTime?
+  verifiedAt  DateTime?
+  rejectedAt  DateTime?
+
+  rejectionReason String?
+
+  verifiedByAdminId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([bookingId])
+  @@index([status])
+}
+
+model PaymentRequest {
+  id        String @id @default(cuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+
+  paymentStage PaymentStage
+  amount       Decimal @db.Decimal(10, 2)
+
+  secureToken String @unique
+  status      PaymentRequestStatus @default(ACTIVE)
+
+  expiresAt DateTime?
+  revokedAt DateTime?
+  paidAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments Payment[]
+
+  @@index([secureToken])
+  @@index([bookingId, paymentStage])
+}
+
+model AdditionalCharge {
+  id        String @id @default(cuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+
+  chargeType  ChargeType
+  description String?
+  amount      Decimal @db.Decimal(10, 2)
+
+  addedByAdminId String?
+  addedAt        DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([bookingId])
+}
+
+model BookingTimeline {
+  id        String @id @default(cuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+
+  eventType           String
+  customerTitle       String
+  customerDescription String?
+
+  createdAt DateTime @default(now())
+
+  @@index([bookingId, createdAt])
+}
+
+model Invoice {
+  id            String @id @default(cuid())
+  bookingId     String
+  booking       Booking @relation(fields: [bookingId], references: [id])
+  invoiceNumber String @unique
+
+  invoiceType String @default("FINAL") // FINAL | ADVANCE_RECEIPT
+
+  invoiceUrl String?
+
+  generatedAt        DateTime @default(now())
+  generatedByAdminId String?
+
+  @@index([bookingId])
+}
+
+model EmailLog {
+  id        String @id @default(cuid())
+  bookingId String?
+  booking   Booking? @relation(fields: [bookingId], references: [id])
+
+  emailType String
+  recipient String
+  subject   String
+
+  resendMessageId String?
+
+  status       EmailStatus @default(PENDING)
+  errorMessage String?
+
+  sentAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([bookingId])
+  @@index([emailType])
+}
+
+model AuditLog {
+  id         String @id @default(cuid())
+  adminId    String
+  actionType String
+
+  entityType String
+  entityId   String
+
+  oldValue Json?
+  newValue Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([adminId, createdAt])
+}
+
+model CustomerQuery {
+  id        String @id @default(cuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+
+  customerMessage String
+  status          QueryStatus @default(OPEN)
+  adminResponse   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([bookingId])
+}
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model ReminderLog {
+  id        String   @id @default(cuid())
+  bookingId String
+  stage     PaymentStage
+  sentAt    DateTime @default(now())
+
+  @@index([bookingId, stage])
+}
