@@ -2,14 +2,17 @@ FROM node:24-bookworm-slim
 
 WORKDIR /app
 
-# Install dependencies
+# Copy package files
 COPY package.json package-lock.json ./
-RUN npm ci
 
-# Copy Prisma schema
+# IMPORTANT: Copy Prisma schema BEFORE npm ci
+# because npm ci runs postinstall -> prisma generate
 COPY prisma ./prisma
 
-# Generate Prisma Client
+# Install dependencies
+RUN npm ci
+
+# Generate Prisma Client explicitly as well
 RUN npx prisma generate
 
 # Copy the rest of the application
@@ -20,5 +23,5 @@ ENV PORT=8000
 
 EXPOSE 8000
 
-# Create/update database tables, then start server
+# Create/update database tables, then start the application
 CMD ["sh", "-c", "npx prisma db push && node server.js"]
