@@ -15,39 +15,19 @@ const {
 
 const PAYMENT_LINK_TTL_DAYS = 7;
 
-function getAppUrl() {
-  const appUrl = String(process.env.APP_URL || "")
-    .trim()
-    .replace(/\/+$/, "");
-
-  if (!appUrl) {
-    const error = new Error(
-      "APP_URL environment variable is missing."
-    );
-
-    error.statusCode = 500;
-    throw error;
-  }
-
-  return appUrl;
-}
-
-function getChargeLabel(charge) {
-  return (
-    charge.description ||
-    charge.name ||
-    charge.category ||
-    charge.type ||
-    "Additional Charge"
-  );
-}
 
 module.exports = withErrorHandling(
   requireAdmin(async (req, res, session) => {
     if (!methodGuard(req, res, "POST")) return;
 
+
     const body = await readJsonBody(req);
-    const bookingId = String(body.bookingId || "").trim();
+
+    const bookingId =
+      typeof body.bookingId === "string"
+        ? body.bookingId.trim()
+        : "";
+
 
     if (!bookingId) {
       return sendJson(res, 400, {
@@ -55,17 +35,30 @@ module.exports = withErrorHandling(
       });
     }
 
-    const appUrl = getAppUrl();
 
-    const booking = await prisma.booking.findUnique({
-      where: {
-        bookingId,
-      },
-      include: {
-        charges: true,
-        customer: true,
-      },
-    });
+    const appUrl =
+      String(process.env.APP_URL || "")
+        .trim()
+        .replace(/\/+$/, "");
+
+
+    if (!appUrl) {
+      throw Object.assign(
+        new Error(
+          "APP_URL environment variable is missing."
+        ),
+        { statusCode: 500 }
+      );
+    }
+
+
+    const booking =
+      await prisma.booking.findUnique({
+        where: {
+          bookingId,
+        },
+      });
+
 
     if (!booking) {
       return sendJson(res, 404, {
@@ -73,259 +66,374 @@ module.exports = withErrorHandling(
       });
     }
 
-    if (booking.tripStatus !== "TRAVEL_COMPLETED") {
+
+    if (
+      booking.tripStatus !==
+      "TRAVEL_COMPLETED"
+    ) {
       return sendJson(res, 409, {
         error:
           "Trip must be marked Travel Completed before finalizing charges.",
       });
     }
 
+
     const existingActiveFinal =
       await prisma.paymentRequest.findFirst({
         where: {
-          bookingId: booking.id,
-          paymentStage: "FINAL",
-          status: "ACTIVE",
+          bookingId:
+            booking.id,
+
+          paymentStage:
+            "FINAL",
+
+          status:
+            "ACTIVE",
         },
       });
 
-    if (existingActiveFinal) {
-      const existingPaymentUrl =
-        `${appUrl}/payment.html?token=` +
-        encodeURIComponent(existingActiveFinal.secureToken);
 
+    if (existingActiveFinal) {
       return sendJson(res, 409, {
         error:
           "A final payment request is already active for this booking.",
-        paymentUrl: existingPaymentUrl,
       });
     }
 
-    const result = await prisma.$transaction(
-      async (tx) => {
-        const recalced =
-          await recalculateBookingFinancials(
-            booking.id,
-            tx
-          );
 
-        const outstandingBalance = Number(
-          recalced.outstandingBalance || 0
-        );
+    const secureToken =
+      generateSecureToken();
 
-        const finalAmountDue = Number(
-          recalced.finalAmountDue ||
-          recalced.outstandingBalance ||
-          0
-        );
 
-        if (finalAmountDue <= 0) {
-          const error = new Error(
-            "Outstanding balance is ₹0. No final payment is required."
-          );
+    const expiresAt =
+      new Date(
+        Date.now() +
+        PAYMENT_LINK_TTL_DAYS *
+        24 *
+        60 *
+        60 *
+        1000
+      );
 
-          error.statusCode = 409;
-          throw error;
-        }
 
-        const secureToken = generateSecureToken();
+    const result =
+      await prisma.$transaction(
+        async (tx) => {
 
-        const paymentRequest =
-          await tx.paymentRequest.create({
-            data: {
-              bookingId: booking.id,
-              paymentStage: "FINAL",
-              amount: finalAmountDue,
-              secureToken,
-              status: "ACTIVE",
-              expiresAt: new Date(
-                Date.now() +
-                  PAYMENT_LINK_TTL_DAYS *
-                    24 *
-                    60 *
-                    60 *
-                    1000
+          // IMPORTANT:
+          // recalculateBookingFinancials MUST use tx when supplied.
+
+          const recalculated =
+            await recalculateBookingFinancials(
+              booking.id,
+              tx
+            );
+
+
+          const finalAmountDue =
+            Number(
+              recalculated.finalAmountDue || 0
+            );
+
+
+          if (
+            !Number.isFinite(finalAmountDue) ||
+            finalAmountDue <= 0
+          ) {
+            throw Object.assign(
+              new Error(
+                "Final payment amount is ₹0. No final payment request is required."
               ),
-            },
-          });
+              {
+                statusCode: 409,
+              }
+            );
+          }
 
-        const updatedBooking =
-          await tx.booking.update({
-            where: {
-              id: booking.id,
-            },
+
+          const updatedBooking =
+            await tx.booking.update({
+              where: {
+                id: booking.id,
+              },
+
+              data: {
+                paymentStatus:
+                  "FINAL_PAYMENT_REQUIRED",
+              },
+            });
+
+
+          const paymentRequest =
+            await tx.paymentRequest.create({
+              data: {
+                bookingId:
+                  booking.id,
+
+                paymentStage:
+                  "FINAL",
+
+                amount:
+                  finalAmountDue,
+
+                secureToken,
+
+                status:
+                  "ACTIVE",
+
+                expiresAt,
+              },
+            });
+
+
+          await tx.payment.create({
             data: {
-              paymentStatus:
-                "FINAL_PAYMENT_REQUIRED",
-            },
-          });
+              bookingId:
+                booking.id,
 
-        await tx.payment.create({
-          data: {
-            bookingId: booking.id,
-            paymentStage: "FINAL",
-            amount: finalAmountDue,
-            status: "REQUIRED",
-            paymentRequestId:
-              paymentRequest.id,
-          },
-        });
+              paymentStage:
+                "FINAL",
 
-        await addTimelineEvent(
-          booking.id,
-          "FINAL_CHARGES_ADDED",
-          { tx }
-        );
+              paymentType:
+                "MANUAL_UPI",
 
-        await addTimelineEvent(
-          booking.id,
-          "FINAL_PAYMENT_REQUIRED",
-          { tx }
-        );
+              amount:
+                finalAmountDue,
 
-        await addAuditLog(
-          {
-            adminId: session.adminId,
-            actionType:
-              "FINAL_PAYMENT_REQUEST_CREATED",
-            entityType: "Booking",
-            entityId: booking.id,
-            oldValue: null,
-            newValue: {
-              amount: finalAmountDue,
-              outstandingBalance,
+              status:
+                "REQUIRED",
+
               paymentRequestId:
                 paymentRequest.id,
             },
-          },
-          tx
-        );
+          });
 
-        return {
-          updatedBooking,
-          paymentRequest,
-          recalced,
-        };
-      },
-      {
-        maxWait: 10000,
-        timeout: 20000,
-      }
-    );
+
+          await addTimelineEvent(
+            booking.id,
+            "FINAL_CHARGES_ADDED",
+            { tx }
+          );
+
+
+          await addTimelineEvent(
+            booking.id,
+            "FINAL_PAYMENT_REQUIRED",
+            { tx }
+          );
+
+
+          await addAuditLog(
+            {
+              adminId:
+                session.adminId,
+
+              actionType:
+                "FINAL_PAYMENT_REQUEST_CREATED",
+
+              entityType:
+                "Booking",
+
+              entityId:
+                booking.id,
+
+              oldValue:
+                null,
+
+              newValue: {
+                finalAmountDue,
+                paymentRequestId:
+                  paymentRequest.id,
+              },
+            },
+            tx
+          );
+
+
+          return {
+            updatedBooking,
+            paymentRequest,
+            recalculated,
+          };
+        },
+        {
+          maxWait: 10000,
+          timeout: 20000,
+        }
+      );
+
+
+    // Reload AFTER transaction.
+    // Do not use base prisma queries from inside the tx helper incorrectly.
 
     const freshBooking =
       await prisma.booking.findUnique({
         where: {
           id: booking.id,
         },
+
         include: {
           charges: true,
-          customer: true,
         },
       });
 
+
     if (!freshBooking) {
-      throw new Error(
-        "Booking could not be reloaded."
+      throw Object.assign(
+        new Error(
+          "Booking not found after final payment creation."
+        ),
+        {
+          statusCode: 500,
+        }
       );
     }
+
+
+    const {
+      updatedBooking,
+      paymentRequest,
+      recalculated,
+    } = result;
+
 
     const paymentUrl =
       `${appUrl}/payment.html?token=` +
       encodeURIComponent(
-        result.paymentRequest.secureToken
+        paymentRequest.secureToken
       );
+
 
     const normalizedCharges =
       (freshBooking.charges || []).map(
-        (charge) => ({
-          id: charge.id,
-          label: getChargeLabel(charge),
-          description: getChargeLabel(charge),
-          amount: Number(charge.amount || 0),
-        })
+        (charge) => {
+
+          const label =
+            charge.description ||
+            charge.name ||
+            charge.category ||
+            charge.type ||
+            "Additional Charge";
+
+
+          return {
+            ...charge,
+
+            label,
+
+            description:
+              label,
+
+            amount:
+              Number(
+                charge.amount || 0
+              ),
+          };
+        }
       );
 
-    const finalAmountDue = Number(
-      result.paymentRequest.amount
-    );
 
-    // IMPORTANT:
-    // outstandingBalance can be confused with finalAmountDue
-    // after extra charges. Calculate the base remaining amount.
-    const additionalChargesTotal =
-      normalizedCharges.reduce(
-        (total, charge) =>
-          total + Number(charge.amount || 0),
+    const baseAmount =
+      Number(
+        freshBooking.baseAmount || 0
+      );
+
+
+    const advancePaid =
+      Number(
+        recalculated.advancePaidAmount ||
+        freshBooking.advancePaidAmount ||
         0
       );
 
-    const remainingBaseAmount = Math.max(
-      0,
-      finalAmountDue - additionalChargesTotal
-    );
 
-    let emailSent = false;
-    let emailError = null;
+    const remainingBaseAmount =
+      Math.max(
+        0,
+        baseAmount - advancePaid
+      );
+
+
+    const finalAmountDue =
+      Number(
+        paymentRequest.amount || 0
+      );
+
 
     try {
       await sendAndLogEmail(
         "final_payment_required",
+
         freshBooking.customerEmail,
+
         {
           booking: {
             ...freshBooking,
-            finalAmountDue,
+
+            baseAmount,
+
+            advancePaid,
+
             remainingBaseAmount,
+
+            finalAmountDue,
           },
 
-          charges: normalizedCharges,
+          charges:
+            normalizedCharges,
+
           additionalCharges:
             normalizedCharges,
 
+          baseAmount,
+
+          advancePaid,
+
           remainingBaseAmount,
+
           finalAmountDue,
 
           paymentUrl,
+
           paymentToken:
-            result.paymentRequest.secureToken,
+            paymentRequest.secureToken,
 
           paymentLinkExpiresAt:
-            result.paymentRequest.expiresAt,
+            paymentRequest.expiresAt,
         },
+
         freshBooking.id
       );
+    } catch (emailError) {
 
-      emailSent = true;
-    } catch (error) {
       console.error(
-        "[Final payment email error]",
-        error
+        "[final payment email error]",
+        emailError
       );
-
-      emailError =
-        "Payment request was created, but the email could not be sent.";
     }
+
 
     return sendJson(res, 200, {
       success: true,
 
-      message: emailSent
-        ? "Final payment request created and emailed successfully."
-        : "Final payment request was created successfully. Email delivery failed.",
+      message:
+        "Final charges finalized and payment request created successfully.",
 
-      emailSent,
-      emailError,
-
-      booking: result.updatedBooking,
+      booking:
+        updatedBooking,
 
       payment: {
-        stage: "FINAL",
-        amount: finalAmountDue,
+        stage:
+          "FINAL",
+
+        amount:
+          finalAmountDue,
+
         token:
-          result.paymentRequest.secureToken,
+          paymentRequest.secureToken,
+
         expiresAt:
-          result.paymentRequest.expiresAt,
+          paymentRequest.expiresAt,
       },
 
       paymentUrl,
